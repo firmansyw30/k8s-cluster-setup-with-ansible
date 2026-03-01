@@ -1,0 +1,262 @@
+---
+- name: "Stage 0: Connectivity Check"
+  hosts: all
+  gather_facts: no
+  tasks:
+    - name: Ping all nodes
+      ping:
+
+- name: "Stage 1: Common Configuration (All Nodes)"
+  hosts: all
+  become: yes
+  vars:
+    # Kubernetes Version to install (Update this to the specific minor version you want)
+    k8s_version: "1.34"
+    # The full package version usually requires a suffix like -1.1
+    k8s_package_version: "1.34.1"
+
+  tasks:
+    - name: Disable Swap (Immediate)
+      command: swapoff -a
+      when: ansible_swaptotal_mb > 0
+
+    - name: Disable Swap (Persistent)
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].*?\sswap\s+sw\s+.*)$'
+        replace: '# \1'
+
+    - name: Load Kernel Modules for Containerd
+      copy:
+        dest: /etc/modules-load.d/containerd.conf
+        content: |
+          overlay
+          br_netfilter
+
+    - name: Load Kernel Modules immediately
+      modprobe:
+        name: "{{ item }}"
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Configure Sysctl parameters for K8s
+      copy:
+        dest: /etc/sysctl.d/99-kubernetes-cri.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.ipv4.ip_forward                 = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+
+    - name: Apply Sysctl params
+      command: sysctl --system
+
+    - name: Install Dependencies
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gpg
+        state: present
+        update_cache: yes
+
+    # --- Containerd Setup ---
+    - name: Create keyrings directory (if not exists)
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Download Docker GPG key
+      get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: '0644'
+        force: true
+
+    - name: Add Docker Repository
+      apt_repository:
+        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+
+    - name: Install Containerd
+      apt:
+        name: containerd.io
+        state: present
+        update_cache: yes
+
+    - name: Create Containerd directory
+      file:
+        path: /etc/containerd
+        state: directory
+
+    - name: Generate default Containerd config
+      shell: containerd config default > /etc/containerd/config.toml
+
+    - name: Configure SystemdCgroup for Containerd
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+
+    - name: Restart Containerd
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+
+    # --- Kubernetes Package Setup (pkgs.k8s.io) ---
+    - name: Download Kubernetes GPG Key
+      shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Add Kubernetes Repository
+      copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        content: |
+          deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/ /
+
+    - name: Install Kubelet, Kubeadm, Kubectl
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+        update_cache: yes
+
+    - name: Hold Kubernetes packages
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    - name: Allow full communication between k8s nodes (UFW)
+      ufw:
+        rule: allow
+        src: "{{ hostvars[item]['ansible_host'] }}"
+        comment: "Allow all traffic from {{ item }}"
+      loop: "{{ groups['all'] }}"
+
+    - name: Allow internal private network (UFW)
+      ufw:
+        rule: allow
+        src: "10.0.0.0/8"
+        comment: "Allow internal private network traffic"
+
+- name: "Stage 2: Control Plane Initialization (Control Plane Node Only)"
+  hosts: masters
+  become: yes
+  vars:
+    pod_network_cidr: "192.168.0.0/16" # Default for Calico
+  
+  tasks:
+    - name: Check if cluster is already initialized
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: kube_conf
+
+    - name: Initialize Kubernetes Cluster
+      command: >
+        kubeadm init 
+        --pod-network-cidr={{ pod_network_cidr }}
+        --cri-socket unix:///run/containerd/containerd.sock
+        --apiserver-cert-extra-sans={{ ansible_host }}
+      register: kubeadm_init
+      when: not kube_conf.stat.exists
+
+    - name: Create .kube directory for user
+      file:
+        path: /home/{{ ansible_user }}/.kube
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: 0755
+
+    - name: Copy admin.conf to user kube config
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/{{ ansible_user }}/.kube/config
+        remote_src: yes
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+
+    - name: Install Calico CNI Network Operator
+      become: no
+      command: kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.4/manifests/tigera-operator.yaml
+      changed_when: false
+
+    - name: Install Calico Custom Resources
+      become: no
+      command: kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.31.4/manifests/custom-resources.yaml
+      register: calico_cr
+      until: calico_cr.rc == 0
+      retries: 6     
+      delay: 5       
+      changed_when: false
+
+    - name: Generate Join Command
+      command: kubeadm token create --print-join-command
+      register: join_command_raw
+      changed_when: false
+
+    - name: Set Join Command Fact
+      set_fact:
+        join_command: "{{ join_command_raw.stdout }}"
+
+    - name: Fetch kubeconfig to local machine
+      fetch:
+        src: /etc/kubernetes/admin.conf
+        dest: ./kubeconfig
+        flat: yes
+
+    - name: Update kubeconfig to use Public IP (Local)
+      delegate_to: localhost
+      become: no
+      run_once: true
+      replace:
+        path: ./kubeconfig
+        regexp: 'server: https://.*:6443'
+        replace: 'server: https://{{ ansible_host }}:6443'
+
+- name: "Stage 3: Join Workers Node to Cluster"
+  hosts: workers
+  become: yes
+  tasks:
+    - name: Check if worker is already joined
+      stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: worker_conf
+
+    - name: Join Cluster
+      command: "{{ hostvars[groups['masters'][0]]['join_command'] }}"
+      when: not worker_conf.stat.exists
+
+- name: "Stage 4: Verify Cluster Status (Local)"
+  hosts: localhost
+  connection: local
+  gather_facts: no
+  tasks:
+    - name: Wait for all nodes to reach Ready state
+      command: kubectl --kubeconfig=./kubeconfig get nodes
+      register: nodes_check
+      # Loops until the string "NotReady" is no longer found in the output
+      until: "'NotReady' not in nodes_check.stdout"
+      retries: 12  # Will try 12 times
+      delay: 10    # Waiting 10 seconds between each try (max 2 minutes)
+      changed_when: false
+
+    - name: Get detailed node status
+      command: kubectl --kubeconfig=./kubeconfig get nodes -o wide
+      register: nodes_wide
+      changed_when: false
+
+    - name: Display cluster nodes
+      debug:
+        msg: "{{ nodes_wide.stdout_lines }}"
